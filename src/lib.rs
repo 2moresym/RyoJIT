@@ -24,6 +24,19 @@
 //!   gpu/model.rs  gpu/hollywood.rs  gpu/maxwell.rs  gpu/backend_wgpu.rs
 //!   jit/ (C++): emit.cpp  host_caps.cpp  strategy.cpp  (linked as static lib)
 //!
+//! Current on-disk layout (the split has started; the modules below are still
+//! declared in this file as the crate root so that every `crate::` path and
+//! every `#[repr(C)]` layout in here stays exactly as reviewed):
+//!   src/lib.rs                        this file: FFI types, IR, passes,
+//!                                     regalloc, marshaling, cache, runtime, GPU
+//!   src/frontends/wii_ppc/*           REAL: PowerPC Broadway decode + lowering
+//!                                     (replaces the SECTION 7 skeleton)
+//!   src/ir_dump.rs, src/ir_verify.rs  IR text dump + structural well-formedness
+//!                                     checks (debug + test only; no codegen)
+//!   src/jit_stub.rs                   TEMPORARY stand-in for the C++ emitter so
+//!                                     the crate links and the boundary is
+//!                                     testable. Feature-gated `jit-stub`.
+//!
 //! =============================================================================
 
 #![allow(dead_code, unused_variables)]
@@ -32,6 +45,12 @@
 //   memmap2 = "0.9"          // optional; C++ side owns executable memory
 //   libc     = "0.2"         // for free() of C++ allocations if needed
 // No dynasm / dynasmrt — emission moved entirely to C++ (asmjit).
+
+// Debug/verification helpers (Rust-only, never in the execute path).  The
+// temporary stand-in for the C++ emitter is declared down in SECTION 0, next to
+// the `extern "C"` block it replaces, so the two cannot drift.
+pub mod ir_dump;
+pub mod ir_verify;
 
 // =============================================================================
 // SECTION 0: FFI BOUNDARY — the single place Rust and C++ meet
@@ -305,7 +324,14 @@ impl CHostCaps {
 
 // -----------------------------------------------------------------------------
 // Extern "C" declarations — the only symbols the C++ static library must export.
+//
+// While `jit/` (the asmjit-backed emitter) does not exist yet, the `jit-stub`
+// Cargo feature provides these four symbols with a Rust placeholder so the crate
+// links and the boundary stays testable; see src/jit_stub.rs.  Building with
+// `--no-default-features` selects the REAL FFI and fails at link time until the
+// C++ library is in place — that is intentional.
 // -----------------------------------------------------------------------------
+#[cfg(not(feature = "jit-stub"))]
 extern "C" {
     /// Detect host CPU features once. Thread-safe; may be called from any
     /// thread. Result is a pure value (no heap).
@@ -352,6 +378,18 @@ extern "C" {
         target_entry: *const u8,
     ) -> CJitStatus;
 }
+
+// The placeholder implementation of exactly those four symbols (see the note
+// above the extern block).  Signatures must match the declarations above
+// line-for-line: `jit_ffi` imports these four names from the crate root either
+// way, so the Rust side is compiled against an identical surface in both modes.
+#[cfg(feature = "jit-stub")]
+#[path = "jit_stub.rs"]
+pub mod jit_stub;
+#[cfg(feature = "jit-stub")]
+pub use jit_stub::{
+    jit_detect_host_caps, jit_emit_block, jit_free_code, jit_patch_chain,
+};
 
 // =============================================================================
 // SECTION 1: CORE IR — the universal instruction representation
@@ -471,6 +509,35 @@ pub mod ir {
         pub fn push(&mut self, block: BlockId, op: IrOp) {
             self.blocks[block.0 as usize].ops.push(op);
         }
+    }
+
+    impl IrOp {
+        /// True for the ops that transfer control and therefore must be the
+        /// LAST op of a block.
+        ///
+        /// Single source of truth shared by the frontends (which must close
+        /// every block with exactly one of these), the runtime (which closes a
+        /// block that hit the instruction cap) and `ir_verify` (which rejects a
+        /// terminator in the middle or a block with none).  Frontends must not
+        /// re-derive this with their own `matches!`.
+        #[inline]
+        pub fn is_terminator(&self) -> bool {
+            matches!(
+                self,
+                IrOp::Branch { .. }
+                    | IrOp::IndirectBranch { .. }
+                    | IrOp::Call { .. }
+                    | IrOp::Return
+            )
+        }
+    }
+
+    /// `Option<&IrOp>` flavour so callers can say
+    /// `if !is_terminator_op(block.ops.last()) { .. }` without a match arm for
+    /// the empty-block case (an empty block is not terminated).
+    #[inline]
+    pub fn is_terminator_op(op: Option<&IrOp>) -> bool {
+        matches!(op, Some(o) if o.is_terminator())
     }
 }
 
@@ -1999,47 +2066,25 @@ pub mod frontend {
 }
 
 // =============================================================================
-// SECTION 7: WII FRONTEND SKELETON (PowerPC "Broadway", big-endian)
+// SECTION 7: WII FRONTEND (PowerPC "Broadway", big-endian) — IMPLEMENTED
+//
+// The skeleton that used to live here (decode stub + `todo!()` lowering) is
+// now a real module: src/frontends/wii_ppc/.  It is declared with #[path] so
+// the crate-root module name `crate::frontend_wii_ppc` — and therefore every
+// reference to it from this file — is unchanged.
+//
+// What that module owns (read its module doc first; it defines the conventions
+// this core relies on and has no say in here):
+//   • PPC opcode dispatch table: decode (primary + groups 4/19/31/59/63) and
+//     lowering of every decoded instruction into the universal IR above.
+//   • The PPC `Intrinsic` id table (guest register-file / FP / cache ops) —
+//     that table is ALSO part of the C++ contract; see the APPENDIX note at the
+//     bottom of this file.
+//   • DecodedPpc + Frontend impl (same trait, no new methods).
 // =============================================================================
-pub mod frontend_wii_ppc {
-    use crate::frontend::{Frontend, RegisterLayout};
-    use crate::ir::{IrBuilder, BlockId, Endian};
+#[path = "frontends/wii_ppc/mod.rs"]
+pub mod frontend_wii_ppc;
 
-    pub struct DecodedPpc {
-        pub raw: u32,
-        pub opcode: u8, // primary 6-bit opcode field
-    }
-
-    pub struct WiiFrontend;
-
-    impl Frontend for WiiFrontend {
-        type DecodedInsn = DecodedPpc;
-
-        fn decode(&self, bytes: &[u8], pc: u64) -> (DecodedPpc, usize) {
-            let raw = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            let opcode = (raw >> 26) as u8;
-            (DecodedPpc { raw, opcode }, 4)
-        }
-
-        fn lower_to_ir(&self, insn: &DecodedPpc, ir: &mut IrBuilder, block: BlockId) {
-            // real impl: big dispatch table on `opcode` (and extended opcode
-            // for opcode==31/19/63 etc.), each arm emitting IrOp sequences.
-            // Paired-single load/store/arith (PS* instructions) lower to the
-            // VecAdd/VecMul/VecFma IR ops shared with the Switch NEON lowering.
-            todo!("PowerPC opcode dispatch table -> IrOp sequence")
-        }
-
-        fn register_file_layout(&self) -> RegisterLayout {
-            RegisterLayout { gpr_count: 32, fpr_count: 32, vector_reg_count: 32 }
-        }
-
-        fn is_block_terminator(&self, insn: &DecodedPpc) -> bool {
-            matches!(insn.opcode, 18 /* b */ | 16 /* bc */ | 19 /* bclr/bcctr/etc, needs sub-check */)
-        }
-
-        fn endianness(&self) -> Endian { Endian::Big }
-    }
-}
 
 // =============================================================================
 // SECTION 8: SWITCH FRONTEND SKELETON (ARMv8-A, Tegra X1, little-endian)
@@ -2129,6 +2174,86 @@ pub mod runtime {
         pub flags_overflow: bool,
         pub flags_negative: bool,
         pub spill: [u64; 128],
+        /// ---- APPENDED AFTER `spill`; nothing above this line moved ---------
+        ///
+        /// Architected *miscellaneous* guest register file: PPC
+        /// CR/XER/LR/CTR/FPSCR/GQR0..7/TBL/TBU/DEC/…, ARM64 NZCV/FPCR/FPSR/
+        /// TPIDR_EL0/….  Deliberately NOT folded into `gpr` (guest-visible ABI
+        /// registers keep their own slots for the interpreter and the
+        /// debugger) and deliberately NOT aliased onto `spill` (spill slots are
+        /// scratch the allocator may hand out again at any time).  Slot
+        /// numbering is guest-specific and owned by each frontend
+        /// (`frontend_wii_ppc::PpcMisc`, and the ARM64 equivalent when written);
+        /// the emitter only needs
+        ///     mov [r15 + offsetof(CpuState, guest_misc) + 8*i]
+        /// so adding a guest misc register costs zero C++ work.
+        ///
+        /// Offsets of every field above are unchanged by this append:
+        /// gpr=0, fpr=256, vec=512, pc=1024, flags_{z,c,o,n}=1032..1035,
+        /// spill=1040.  `frontends/wii_ppc/layout_tests.rs` asserts exactly
+        /// those constants so an accidental *insert* in the middle fails
+        /// loudly instead of silently aliasing spill slot 0 onto `gpr[0]`
+        /// (the bug the dedicated `spill` array exists to prevent).
+        pub guest_misc: [u64; GUEST_MISC_SLOTS],
+    }
+
+    /// Number of architected misc-register slots available to a frontend.
+    /// 64 × 8 B = 512 B of per-thread state; the Wii uses ~24 of them and the
+    /// Switch will need fewer than 16 for the EL0-visible set.
+    pub const GUEST_MISC_SLOTS: usize = 64;
+
+    impl CpuState {
+        /// Zero-initialised state.  Safe alternative to the `mem::zeroed()` the
+        /// entry point uses; every field here is a plain integer/array so all-zero
+        /// is a valid bit pattern.
+        pub fn new_zeroed() -> Self {
+            // SAFETY: CpuState is all-integer fields (repr(C), no padding
+            // dependencies, no pointer/bool invariants to violate — the four
+            // `flags_*` bools are all-zero == false).
+            unsafe { core::mem::MaybeUninit::zeroed().assume_init() }
+        }
+
+        #[inline]
+        pub fn get_gpr(&self, i: u8) -> u64 {
+            self.gpr[i as usize & 31]
+        }
+
+        #[inline]
+        pub fn set_gpr(&mut self, i: u8, v: u64) {
+            self.gpr[i as usize & 31] = v;
+        }
+
+        /// Raw 64-bit pattern of an FPR slot (a valid IEEE-754 double for FP ops;
+        /// see the frontend's FPR representation contract).
+        #[inline]
+        pub fn get_fpr_bits(&self, i: u8) -> u64 {
+            self.fpr[i as usize & 31].to_bits()
+        }
+
+        #[inline]
+        pub fn set_fpr_bits(&mut self, i: u8, bits: u64) {
+            self.fpr[i as usize & 31] = f64::from_bits(bits);
+        }
+
+        #[inline]
+        pub fn misc(&self, slot: u8) -> u64 {
+            self.guest_misc[slot as usize % GUEST_MISC_SLOTS]
+        }
+
+        #[inline]
+        pub fn set_misc(&mut self, slot: u8, value: u64) {
+            self.guest_misc[slot as usize % GUEST_MISC_SLOTS] = value;
+        }
+
+        #[inline]
+        pub fn vec_reg(&self, i: u8) -> u128 {
+            self.vec[i as usize & 31]
+        }
+
+        #[inline]
+        pub fn set_vec_reg(&mut self, i: u8, v: u128) {
+            self.vec[i as usize & 31] = v;
+        }
     }
 
     /// One system's full execution context: its CPU state, its code cache,
@@ -2256,6 +2381,20 @@ pub mod runtime {
                 .blocks
                 .pop()
                 .expect("new_block always pushes exactly one block");
+
+            // A block that ran into MAX_BLOCK_INSNS without ever hitting a
+            // frontend terminator has no exit at all, and the emitter would
+            // then run off the end of the block into whatever bytes follow.
+            // Close it explicitly at the instruction AFTER the last one we
+            // lowered (`cursor_pc` has already been advanced past it) so the
+            // dispatcher keeps control. Legally-terminated blocks are untouched.
+            if !crate::ir::is_terminator_op(ir_block.ops.last()) {
+                ir_block
+                    .ops
+                    .push(crate::ir::IrOp::IndirectBranch {
+                        target: crate::ir::VOperand::Imm(cursor_pc as i64),
+                    });
+            }
 
             // ---- 2. OPTIMIZE (intra-block, cheap — see passes module) ---
             passes::run_all(&mut ir_block);
@@ -2423,8 +2562,9 @@ pub mod gpu {
 
 // =============================================================================
 // SECTION 11: ENTRY POINT — wires a GuestSystem for each console.
+// (pub so src/main.rs, the binary, can call it; a lib crate has no main)
 // =============================================================================
-fn main() {
+pub fn main() {
     use crate::runtime::GuestSystem;
     use crate::frontend_wii_ppc::WiiFrontend;
     use crate::frontend_switch_arm64::SwitchFrontend;
