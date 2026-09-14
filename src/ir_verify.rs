@@ -132,19 +132,19 @@ fn def_of(op: &IrOp) -> Option<VReg> {
 /// that does not fit must be rejected instead of silently folded.
 fn width_checked_operands(op: &IrOp) -> Vec<(VOperand, Width)> {
     match op {
-        IrOp::Add { a, b, width }
-        | IrOp::Sub { a, b, width }
-        | IrOp::Mul { a, b, width }
-        | IrOp::And { a, b, width }
-        | IrOp::Or { a, b, width }
-        | IrOp::Xor { a, b, width }
+        IrOp::Add { a, b, width, .. }
+        | IrOp::Sub { a, b, width, .. }
+        | IrOp::Mul { a, b, width, .. }
+        | IrOp::And { a, b, width, .. }
+        | IrOp::Or { a, b, width, .. }
+        | IrOp::Xor { a, b, width, .. }
         | IrOp::VecAdd { a, b, width, .. }
         | IrOp::VecMul { a, b, width, .. }
         | IrOp::SetFlags { a, b, width, .. } => vec![(*a, *width), (*b, *width)],
 
-        IrOp::Shl { a, amount, width }
-        | IrOp::Shr { a, amount, width }
-        | IrOp::Sar { a, amount, width } => vec![(*a, *width), (*amount, *width)],
+        IrOp::Shl { a, amount, width, .. }
+        | IrOp::Shr { a, amount, width, .. }
+        | IrOp::Sar { a, amount, width, .. } => vec![(*a, *width), (*amount, *width)],
 
         IrOp::Store { val, width, .. } => vec![(*val, *width)],
 

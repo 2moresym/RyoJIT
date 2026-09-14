@@ -18,6 +18,7 @@ use super::fields::PpcFields;
 use super::intrinsics::{PpcIntr, PpcMisc};
 use super::lower::{rotate_mask, PpcLowerError};
 use super::{WiiFrontend, GUEST_INSN_BYTES, MAX_BLOCK_INSNS};
+use crate::frontend::Frontend;
 use crate::ir::{Endian, IrOp, VOperand, Width};
 use crate::{passes, regalloc};
 use vectors::VECTORS;
@@ -386,11 +387,11 @@ fn passes_and_regalloc_accept_every_lowering() {
 }
 
 fn collect_vregs(op: &IrOp, out: &mut Vec<crate::ir::VReg>) {
-    let mut push = |o: &VOperand| {
+    fn push(out: &mut Vec<crate::ir::VReg>, o: &VOperand) {
         if let VOperand::Reg(v) = *o {
             out.push(v);
         }
-    };
+    }
     match op {
         IrOp::Add { dst, a, b, .. }
         | IrOp::Sub { dst, a, b, .. }
@@ -399,49 +400,49 @@ fn collect_vregs(op: &IrOp, out: &mut Vec<crate::ir::VReg>) {
         | IrOp::Or { dst, a, b, .. }
         | IrOp::Xor { dst, a, b, .. } => {
             out.push(*dst);
-            push(a);
-            push(b);
+            push(out, a);
+            push(out, b);
         }
         IrOp::Shl { dst, a, amount, .. }
         | IrOp::Shr { dst, a, amount, .. }
         | IrOp::Sar { dst, a, amount, .. } => {
             out.push(*dst);
-            push(a);
-            push(amount);
+            push(out, a);
+            push(out, amount);
         }
         IrOp::VecAdd { dst, a, b, .. } | IrOp::VecMul { dst, a, b, .. } => {
             out.push(*dst);
-            push(a);
-            push(b);
+            push(out, a);
+            push(out, b);
         }
         IrOp::VecFma { dst, a, b, c, .. } => {
             out.push(*dst);
-            push(a);
-            push(b);
-            push(c);
+            push(out, a);
+            push(out, b);
+            push(out, c);
         }
         IrOp::Load { dst, addr, .. } => {
             out.push(*dst);
-            push(addr);
+            push(out, addr);
         }
         IrOp::Store { addr, val, .. } => {
-            push(addr);
-            push(val);
+            push(out, addr);
+            push(out, val);
         }
         IrOp::Branch { cond, .. } => {
             if let Some(c) = cond {
-                push(c);
+                push(out, c);
             }
         }
-        IrOp::IndirectBranch { target } | IrOp::Call { target } => push(target),
+        IrOp::IndirectBranch { target } | IrOp::Call { target } => push(out, target),
         IrOp::SetFlags { a, b, .. } => {
-            push(a);
-            push(b);
+            push(out, a);
+            push(out, b);
         }
         IrOp::ReadFlag { dst, .. } => out.push(*dst),
         IrOp::Intrinsic { operands, dst, .. } => {
             for o in operands {
-                push(o);
+                push(out, o);
             }
             if let Some(d) = dst {
                 out.push(*d);
@@ -1100,7 +1101,8 @@ fn width_is_carried_through_integer_ops() {
                 assert!(
                     matches!(w, Width::W32 | Width::W64),
                     "{:#010x}: integer op with width {w:?}; only w32 (GPR) or w64 \
-                     (container/bit-twiddle) are allowed"
+                     (container/bit-twiddle) are allowed",
+                    v.word
                 );
             }
         }

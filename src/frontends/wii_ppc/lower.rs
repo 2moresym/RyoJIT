@@ -1435,6 +1435,13 @@ impl Ctx<'_> {
             SumSecond::Ra => self.get_gpr(f.ra()),
             SumSecond::Rb => self.get_gpr(f.rb()),
             SumSecond::Imm(c) => self.immv(c as i64, Width::W32),
+            // No current call site constructs SumSecond::None (every real
+            // "no second register" form here uses an explicit SumSecond::Imm
+            // instead, e.g. Addze/Addme above). Treated as the additive
+            // identity so the match is exhaustive; this path is currently
+            // untested — verify against the ISA before relying on it if a
+            // future instruction actually needs it.
+            SumSecond::None => self.zero(),
         };
         let yv = if s.inv {
             self.xor(Self::reg(yv), Self::um(LO32), Width::W32)
@@ -1980,7 +1987,7 @@ impl Ctx<'_> {
     fn lower_mfspr(&mut self, f: PpcFields) -> Result<(), PpcLowerError> {
         let spr = f.spr();
         match PpcMisc::access(spr) {
-            SprAccess::Slot(slot) => {
+            SprAccess::Slot(slot, _writable) => {
                 // The time base is the emulator's to update between two reads in one
                 // block, so it goes through the volatile path.
                 let v = if slot == PpcMisc::Tbl.slot() || slot == PpcMisc::Tbu.slot() {
@@ -2020,7 +2027,16 @@ impl Ctx<'_> {
         let spr = f.spr();
         let v = self.get_gpr(f.rt());
         match PpcMisc::access(spr) {
-            SprAccess::Slot(slot) => {
+            SprAccess::Slot(slot, writable) => {
+                if !writable {
+                    // Real Broadway hardware makes mtspr to a read-only SPR (e.g.
+                    // PVR) either a no-op or an illegal instruction depending on
+                    // privilege level; treat it as illegal here rather than
+                    // silently accepting a write the guest should never see take
+                    // effect. Do not collapse this to `_` — the bool is load-
+                    // bearing, not decorative (see PpcMisc::access's table).
+                    return Err(PpcLowerError::Illegal { pc: self.pc, raw: f.raw });
+                }
                 self.set_misc_slot(slot, v);
                 if slot == PpcMisc::Lr.slot() || slot == PpcMisc::Ctr.slot() {
                     // Branch targets depend on these; nothing to do here beyond the
@@ -2467,7 +2483,7 @@ impl Ctx<'_> {
                 let sum = self.vec_add(a_lo, b_hi);
                 let sum_lo = self.and(Self::reg(sum), Self::um(LO32), Width::W64);
                 let c = self.get_ps(f.frc_full());
-                let c_hi = self.and(Self::reg(c), Self::imm((LO32 as u64) << 32), Width::W64);
+                let c_hi = self.and(Self::reg(c), Self::imm(((LO32 as u64) << 32) as i64), Width::W64);
                 self.or(Self::reg(sum_lo), Self::reg(c_hi), Width::W64)
             }
             PsSum1 => {

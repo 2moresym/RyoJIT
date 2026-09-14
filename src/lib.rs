@@ -1577,6 +1577,7 @@ pub mod jit_ffi {
 
     /// Rust-side view of a finished executable block. Owns the memory
     /// returned by the C++ emitter; drops via jit_free_code.
+    #[derive(Debug)]
     pub struct CompiledBlock {
         pub code_ptr: *mut u8,
         pub code_len: usize,
@@ -1776,14 +1777,14 @@ pub mod jit_ffi {
                 c.operands[0] = operand_to_c(a);
                 c.operands[1] = operand_to_c(b);
             }
-            IrOp::VecFma { dst, a, b, c, lanes } => {
+            IrOp::VecFma { dst, a, b, c: c_op, lanes } => {
                 c.kind = CIrOpKind::VecFma;
                 c.dst = dst.0; c.dst_valid = 1;
                 c.lanes = *lanes;
                 c.num_operands = 3;
                 c.operands[0] = operand_to_c(a);
                 c.operands[1] = operand_to_c(b);
-                c.operands[2] = operand_to_c(c);
+                c.operands[2] = operand_to_c(c_op);
             }
             IrOp::Load { dst, addr, width, sign_ext, endian } => {
                 c.kind = CIrOpKind::Load;
