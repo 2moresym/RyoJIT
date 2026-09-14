@@ -1,0 +1,38 @@
+[package]
+name = "ryojit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"          # offset_of! in the layout regression tests
+license = "GPL-2.0-or-later"
+description = "Hybrid Rust + C/C++ JIT core for Nintendo Wii (PPC Broadway) and Switch (ARMv8-A Tegra X1)"
+
+# Zero external crates on purpose: the Rust half of this project is the IR,
+# optimizer, register allocator, frontends, code cache and dispatcher, and none
+# of that needs a dependency.  Executable memory is owned by the C++ emitter
+# (see `jit/` in the real layout) and reached only through the four `extern "C"`
+# symbols declared at the top of `src/lib.rs`.
+[dependencies]
+
+[features]
+default = ["jit-stub"]
+
+# PLACEHOLDER code emitter so the crate links and the Rust side is testable
+# before the C++/asmjit library exists.  Emits `ret` only, and hard-fails the
+# moment a block needs real codegen.  Remove this feature once `jit/` is
+# built and linked (see src/jit_stub.rs).
+jit-stub = []
+
+[lib]
+name = "ryojit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ryojit"
+path = "src/main.rs"
+
+[[test]]
+name = "ppc_pipeline"
+path = "tests/ppc_pipeline.rs"
+
+[profile.dev]
+opt-level = 1
